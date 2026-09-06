@@ -1,0 +1,548 @@
+diff --git a/lib/jxl/enc_ans.cc b/lib/jxl/enc_ans.cc
+index 54017e0..edc0298 100644
+--- a/lib/jxl/enc_ans.cc
++++ b/lib/jxl/enc_ans.cc
+@@ -13,6 +13,7 @@
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdio>
+ #include <limits>
+ #include <utility>
+ #include <vector>
+@@ -833,6 +834,17 @@ Status EntropyEncodingData::ChooseUintConfigs(
+       AlignedMemory::Create(memory_manager, (max_histo_volume + max_vec_size) *
+                                                 sizeof(uint32_t)));
+   for (size_t h = 0; h < num_histo; h++) {
++    if (params.force_one_bit_aperture && histo_volume[h] != 0) {
++      const uint32_t* data = transposed.data() + histo_offset[h];
++      if (std::all_of(data, data + histo_volume[h],
++                      [](uint32_t value) { return value == 2; })) {
++        uint_config[h] = HybridUintConfig(1, 0, 0);
++        // Raw value 2 maps to entropy symbol 2 under both the provisional
++        // default and forced configurations, so no histogram rebuild is
++        // necessary here.
++        continue;
++      }
++    }
+     float best_cost = std::numeric_limits<float>::max();
+     for (HybridUintConfig cfg : configs) {
+       uint32_t max_v = max_value_per_histo[h];
+@@ -916,16 +928,34 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
+     JxlMemoryManager* memory_manager, const HistogramParams& params,
+     const std::vector<std::vector<Token>>& tokens,
+     const std::vector<Histogram>& builder, BitWriter* writer, LayerType layer,
+-    AuxOut* aux_out) {
++    AuxOut* aux_out,
++    const std::vector<uint8_t>* preclustered_context_map) {
+   const size_t prev_histograms = encoding_info.size();
+   std::vector<Histogram> clustered_histograms;
+   for (size_t i = 0; i < prev_histograms; ++i) {
+     clustered_histograms.push_back(
+         HistogramFromSymbolInfo(encoding_info[i], use_prefix_code));
+   }
+-  size_t context_offset = context_map.size();
+-  context_map.resize(context_offset + builder.size());
+-  if (builder.size() > 1) {
++  if (preclustered_context_map != nullptr) {
++    // Developer-only zero-token path: `builder` already contains the two
++    // residual classes (ordinary zero and one-bit aperture), while the full
++    // logical map still has one entry per MA leaf for a stock decoder.
++    JXL_ENSURE(prev_histograms == 0);
++    JXL_ENSURE(context_map.empty());
++    JXL_ENSURE(!preclustered_context_map->empty());
++    JXL_ENSURE(builder.size() == 1 || builder.size() == 2);
++    for (uint8_t histogram : *preclustered_context_map) {
++      JXL_ENSURE(histogram < builder.size());
++    }
++    context_map = *preclustered_context_map;
++    clustered_histograms = builder;
++    if (writer != nullptr && context_map.size() > 1) {
++      JXL_RETURN_IF_ERROR(EncodeContextMap(
++          context_map, clustered_histograms.size(), writer, layer, aux_out));
++    }
++  } else if (builder.size() > 1) {
++    size_t context_offset = context_map.size();
++    context_map.resize(context_offset + builder.size());
+     if (!ans_fuzzer_friendly_) {
+       std::vector<uint32_t> histogram_symbols;
+       JXL_RETURN_IF_ERROR(ClusterHistograms(params, builder, kClustersLimit,
+@@ -955,6 +985,7 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
+     }
+   } else {
+     JXL_ENSURE(encoding_info.empty());
++    context_map.resize(1);
+     clustered_histograms.push_back(builder[0]);
+   }
+   if (aux_out != nullptr) {
+@@ -1123,43 +1154,104 @@ StatusOr<size_t> BuildAndEncodeHistograms(
+       tokens = std::move(tokens_lz77);
+     }
+     size_t total_tokens = 0;
+-    // Build histograms.
+-    std::vector<Histogram> builder(num_contexts);
++    // Build histograms. jxl_from_tree's generated stream has only two
++    // residual classes, but a large MA program can have millions of logical
++    // leaf contexts. Avoid allocating and clustering one Histogram per leaf;
++    // retain the full logical context map for the stock decoder instead.
++    std::vector<Histogram> builder;
++    std::vector<uint8_t> preclustered_context_map;
++    bool use_preclustered_context_map = false;
+     HybridUintConfig uint_config = params.UintConfig();
+     if (ans_fuzzer_friendly_) {
+       uint_config = HybridUintConfig(10, 0, 0);
+     }
+-    for (const auto& stream : tokens) {
+-      if (codes->lz77.enabled) {
+-        for (const auto& token : stream) {
+-          total_tokens++;
+-          uint32_t tok, nbits, bits;
+-          (token.is_lz77_length ? codes->lz77.length_uint_config : uint_config)
+-              .Encode(token.value, &tok, &nbits, &bits);
+-          tok += token.is_lz77_length ? codes->lz77.min_symbol : 0;
+-          JXL_DASSERT(token.context < num_contexts);
+-          builder[token.context].Add(tok);
+-        }
+-      } else if (num_contexts == 1) {
++
++    const bool may_precluster_zero_tokens =
++        params.force_one_bit_aperture && !codes->lz77.enabled &&
++        !params.add_missing_symbols && !params.add_fixed_histograms &&
++        params.initialize_global_state && !ans_fuzzer_friendly_ &&
++        writer != nullptr && num_contexts > 1 &&
++        codes->encoding_info.empty() && codes->context_map.empty();
++    if (may_precluster_zero_tokens) {
++      builder.resize(2);
++      preclustered_context_map.resize(num_contexts, 0);
++      // 0 means unseen, 1 means ordinary zero, 2 means aperture value 2.
++      std::vector<uint8_t> seen_context(num_contexts, 0);
++      bool valid = true;
++      bool saw_zero = false;
++      bool saw_aperture = false;
++      for (const auto& stream : tokens) {
+         for (const auto& token : stream) {
++          if (token.is_lz77_length || token.context >= num_contexts ||
++              (token.value != 0 && token.value != 2)) {
++            valid = false;
++            break;
++          }
++          const uint8_t histogram = token.value == 2 ? 1 : 0;
++          const uint8_t seen = histogram + 1;
++          if (seen_context[token.context] != 0 &&
++              seen_context[token.context] != seen) {
++            valid = false;
++            break;
++          }
++          seen_context[token.context] = seen;
++          preclustered_context_map[token.context] = histogram;
++          saw_zero |= histogram == 0;
++          saw_aperture |= histogram == 1;
+           total_tokens++;
+           uint32_t tok, nbits, bits;
+           uint_config.Encode(token.value, &tok, &nbits, &bits);
+-          builder[0].Add(tok);
++          builder[histogram].Add(tok);
+         }
++        if (!valid) break;
++      }
++      // A lone all-zero class is also compact. An aperture-only stream is not
++      // expected and falls back because unseen logical contexts map to zero.
++      if (valid && saw_zero) {
++        use_preclustered_context_map = true;
++        if (!saw_aperture) builder.resize(1);
+       } else {
+-        for (const auto& token : stream) {
+-          total_tokens++;
+-          uint32_t tok, nbits, bits;
+-          uint_config.Encode(token.value, &tok, &nbits, &bits);
+-          JXL_DASSERT(token.context < num_contexts);
+-          builder[token.context].Add(tok);
++        builder.clear();
++        preclustered_context_map.clear();
++        total_tokens = 0;
++      }
++    }
++
++    if (!use_preclustered_context_map) {
++      builder.resize(num_contexts);
++      for (const auto& stream : tokens) {
++        if (codes->lz77.enabled) {
++          for (const auto& token : stream) {
++            total_tokens++;
++            uint32_t tok, nbits, bits;
++            (token.is_lz77_length ? codes->lz77.length_uint_config
++                                  : uint_config)
++                .Encode(token.value, &tok, &nbits, &bits);
++            tok += token.is_lz77_length ? codes->lz77.min_symbol : 0;
++            JXL_DASSERT(token.context < num_contexts);
++            builder[token.context].Add(tok);
++          }
++        } else if (num_contexts == 1) {
++          for (const auto& token : stream) {
++            total_tokens++;
++            uint32_t tok, nbits, bits;
++            uint_config.Encode(token.value, &tok, &nbits, &bits);
++            builder[0].Add(tok);
++          }
++        } else {
++          for (const auto& token : stream) {
++            total_tokens++;
++            uint32_t tok, nbits, bits;
++            uint_config.Encode(token.value, &tok, &nbits, &bits);
++            JXL_DASSERT(token.context < num_contexts);
++            builder[token.context].Add(tok);
++          }
+         }
+       }
+     }
+ 
+     if (params.add_missing_symbols) {
+-      for (size_t c = 0; c < num_contexts; ++c) {
++      for (size_t c = 0; c < builder.size(); ++c) {
+         for (int symbol = 0; symbol < ANS_MAX_ALPHABET_SIZE; ++symbol) {
+           builder[c].Add(symbol);
+         }
+@@ -1173,7 +1265,7 @@ StatusOr<size_t> BuildAndEncodeHistograms(
+           ans_fuzzer_friendly_;
+       if (!use_prefix_code) {
+         bool all_singleton = true;
+-        for (size_t i = 0; i < num_contexts; i++) {
++        for (size_t i = 0; i < builder.size(); i++) {
+           if (builder[i].ShannonEntropy() >= 1e-5) {
+             all_singleton = false;
+           }
+@@ -1215,8 +1307,10 @@ StatusOr<size_t> BuildAndEncodeHistograms(
+     // Encode histograms.
+     JXL_ASSIGN_OR_RETURN(
+         size_t entropy_bits,
+-        codes->BuildAndStoreEntropyCodes(memory_manager, params, tokens,
+-                                         builder, writer, layer, aux_out));
++        codes->BuildAndStoreEntropyCodes(
++            memory_manager, params, tokens, builder, writer, layer, aux_out,
++            use_preclustered_context_map ? &preclustered_context_map
++                                         : nullptr));
+     cost += entropy_bits;
+     return true;
+   };
+@@ -1240,6 +1334,7 @@ size_t WriteTokens(const std::vector<Token>& tokens,
+                    BitWriter* writer) {
+   size_t num_extra_bits = 0;
+   if (codes.use_prefix_code) {
++    std::vector<size_t> one_bit_offsets;
+     for (const auto& token : tokens) {
+       uint32_t tok, nbits, bits;
+       size_t histo = codes.context_map[context_offset + token.context];
+@@ -1254,9 +1349,26 @@ size_t WriteTokens(const std::vector<Token>& tokens,
+       uint64_t data = codes.encoding_info[histo][tok].bits;
+       data |= static_cast<uint64_t>(bits)
+               << codes.encoding_info[histo][tok].depth;
++      if (!token.is_lz77_length && token.value == 2 && nbits == 1) {
++        one_bit_offsets.push_back(
++            writer->BitsWritten() + codes.encoding_info[histo][tok].depth);
++      }
+       writer->Write(codes.encoding_info[histo][tok].depth + nbits, data);
+       num_extra_bits += nbits;
+     }
++    if (one_bit_offsets.size() >= 320) {
++      const size_t real_start = one_bit_offsets[one_bit_offsets.size() - 320];
++      bool contiguous = true;
++      for (size_t i = 0; i < 320; ++i) {
++        contiguous &= one_bit_offsets[one_bit_offsets.size() - 320 + i] ==
++                      real_start + i;
++      }
++      fprintf(stderr,
++              "JXL_FROM_TREE_APERTURE_BITS=%zu START=%zu MOD8=%zu "
++              "CONTIGUOUS=%d\n",
++              one_bit_offsets.size(), real_start, real_start & 7,
++              contiguous ? 1 : 0);
++    }
+     return num_extra_bits;
+   }
+   std::vector<uint64_t> out;
+@@ -1281,6 +1393,13 @@ size_t WriteTokens(const std::vector<Token>& tokens,
+   };
+   const int end = tokens.size();
+   ANSCoder ans;
++  struct OneBitMarker {
++    size_t suffix_bits;
++    uint8_t ans_bits;
++    uint8_t token_bits;
++  };
++  std::vector<OneBitMarker> one_bit_markers;
++  size_t reverse_token_bits = 0;
+   if (codes.lz77.enabled || codes.context_map.size() > 1) {
+     for (int i = end - 1; i >= 0; --i) {
+       const Token token = tokens[i];
+@@ -1298,6 +1417,12 @@ size_t WriteTokens(const std::vector<Token>& tokens,
+       uint8_t ans_nbits = 0;
+       uint32_t ans_bits = ans.PutSymbol(info, &ans_nbits);
+       addbits(ans_bits, ans_nbits);
++      if (!token.is_lz77_length && token.value == 2 && nbits == 1) {
++        one_bit_markers.push_back(
++            {reverse_token_bits, ans_nbits,
++             static_cast<uint8_t>(ans_nbits + nbits)});
++      }
++      reverse_token_bits += ans_nbits + nbits;
+     }
+   } else {
+     for (int i = end - 1; i >= 0; --i) {
+@@ -1310,9 +1435,41 @@ size_t WriteTokens(const std::vector<Token>& tokens,
+       uint8_t ans_nbits = 0;
+       uint32_t ans_bits = ans.PutSymbol(info, &ans_nbits);
+       addbits(ans_bits, ans_nbits);
++      if (!tokens[i].is_lz77_length && tokens[i].value == 2 && nbits == 1) {
++        one_bit_markers.push_back(
++            {reverse_token_bits, ans_nbits,
++             static_cast<uint8_t>(ans_nbits + nbits)});
++      }
++      reverse_token_bits += ans_nbits + nbits;
+     }
+   }
+   const uint32_t state = ans.GetState();
++  // Developer-only witness for the exact physical bit position of the EOF
++  // input aperture.  The ANS loop runs backwards, so each saved suffix size
++  // is converted back to its forward stream offset.  The last 320 one-bit
++  // residuals belong to the real aperture; any preceding markers are ignored
++  // alignment visits in the previous optional channel.
++  if (one_bit_markers.size() >= 320) {
++    std::vector<size_t> offsets;
++    offsets.reserve(one_bit_markers.size());
++    const size_t token_stream_start = writer->BitsWritten() + 32;
++    for (const OneBitMarker& marker : one_bit_markers) {
++      offsets.push_back(token_stream_start + reverse_token_bits -
++                        marker.suffix_bits - marker.token_bits +
++                        marker.ans_bits);
++    }
++    std::sort(offsets.begin(), offsets.end());
++    const size_t real_start = offsets[offsets.size() - 320];
++    bool contiguous = true;
++    for (size_t i = 0; i < 320; ++i) {
++      contiguous &= offsets[offsets.size() - 320 + i] == real_start + i;
++    }
++    fprintf(stderr,
++            "JXL_FROM_TREE_APERTURE_BITS=%zu START=%zu MOD8=%zu "
++            "CONTIGUOUS=%d\n",
++            one_bit_markers.size(), real_start, real_start & 7,
++            contiguous ? 1 : 0);
++  }
+   writer->Write(32, state);
+   writer->Write(numallbits, allbits);
+   for (int i = out.size(); i > 0; --i) {
+diff --git a/lib/jxl/enc_ans.h b/lib/jxl/enc_ans.h
+index 8922f33..d62cdd5 100644
+--- a/lib/jxl/enc_ans.h
++++ b/lib/jxl/enc_ans.h
+@@ -106,7 +106,8 @@ struct EntropyEncodingData {
+       JxlMemoryManager* memory_manager, const HistogramParams& params,
+       const std::vector<std::vector<Token>>& tokens,
+       const std::vector<Histogram>& builder, BitWriter* writer, LayerType layer,
+-      AuxOut* aux_out);
++      AuxOut* aux_out,
++      const std::vector<uint8_t>* preclustered_context_map = nullptr);
+ 
+   StatusOr<size_t> BuildAndStoreANSEncodingData(
+       JxlMemoryManager* memory_manager,
+diff --git a/lib/jxl/enc_ans_params.h b/lib/jxl/enc_ans_params.h
+index b3c1f50..2acfbc7 100644
+--- a/lib/jxl/enc_ans_params.h
++++ b/lib/jxl/enc_ans_params.h
+@@ -108,6 +108,10 @@ struct HistogramParams {
+   std::vector<size_t> image_widths;
+   size_t max_histograms = ~0;
+   bool force_huffman = false;
++  // Developer-only aid for jxl_from_tree. A clustered context whose raw
++  // values are all 2 is encoded with HybridUintConfig(1, 0, 0): symbol 2 is
++  // singleton (zero prefix bits) but each occurrence carries one extra bit.
++  bool force_one_bit_aperture = false;
+   bool initialize_global_state = true;
+   bool streaming_mode = false;
+   bool add_missing_symbols = false;
+diff --git a/lib/jxl/enc_modular.cc b/lib/jxl/enc_modular.cc
+index 8a442d8..d1fab99 100644
+--- a/lib/jxl/enc_modular.cc
++++ b/lib/jxl/enc_modular.cc
+@@ -1315,6 +1315,12 @@ Status ModularFrameEncoder::EncodeGlobalInfo(bool streaming_mode,
+     JXL_RETURN_IF_ERROR(WriteTokens(tree_tokens_[0], tree_code, 0, writer,
+                                     LayerType::ModularTree, aux_out));
+   }
++  // jxl_from_tree sets zero_tokens: retain a one-bit input aperture while all
++  // ordinary computation contexts remain zero-bit singletons.
++  if (cparams_.options.zero_tokens) {
++    params.force_one_bit_aperture = true;
++    params.lz77_method = HistogramParams::LZ77Method::kNone;
++  }
+   params.streaming_mode = streaming_mode;
+   params.add_missing_symbols = streaming_mode;
+   params.image_widths = image_widths_;
+diff --git a/lib/jxl/modular/encoding/enc_encoding.cc b/lib/jxl/modular/encoding/enc_encoding.cc
+index 7bf5dd5..5bf478f 100644
+--- a/lib/jxl/modular/encoding/enc_encoding.cc
++++ b/lib/jxl/modular/encoding/enc_encoding.cc
+@@ -477,6 +477,78 @@ Status EncodeModularChannelMAANS(const Image &image, pixel_type chan,
+   return true;
+ }
+ 
++// A Zero+251 leaf is the input aperture used by the experimental
++// jxl_from_tree fork. Its baseline residual is packed value 2, which decodes
++// to +1. With HybridUintConfig(1, 0, 0), the same singleton entropy symbol can
++// also decode to packed value 3 (-2) by changing one raw extra bit.
++constexpr pixel_type_w kInputApertureOffset = 251;
++
++Status GenerateModularChannelMAANS(Image *image, pixel_type chan,
++                                   const Tree &global_tree, Token **tokenpp,
++                                   size_t group_id) {
++  Channel &channel = image->channel[chan];
++  JxlMemoryManager *memory_manager = channel.memory_manager();
++  Token *tokenp = *tokenpp;
++
++  std::array<pixel_type, kNumStaticProperties> static_props = {
++      {chan, static_cast<int>(group_id)}};
++  bool use_wp;
++  bool is_wp_only;
++  bool is_gradient_only;
++  size_t num_props;
++  FlatTree tree = FilterTree(global_tree, static_props, &num_props, &use_wp,
++                             &is_wp_only, &is_gradient_only);
++  if (use_wp) {
++    return JXL_FAILURE("Input-aperture generation does not support WP trees");
++  }
++  // The large hash-machine tree uses many optional channels solely to raise
++  // the stock decoder's dynamic MA-tree limit. After filtering on the static
++  // channel property, each padding channel is exactly one Zero+0 leaf. Avoid
++  // evaluating the predictor and constructing properties for every one of
++  // those pixels; this is equivalent to the loop below, including its
++  // logical leaf context, but turns tens of millions of no-op visits into two
++  // linear fills.
++  if (tree.size() == 1 && tree[0].property0 == -1 &&
++      tree[0].predictor == Predictor::Zero &&
++      tree[0].predictor_offset == 0 && tree[0].multiplier == 1) {
++    const size_t count = channel.w * channel.h;
++    std::fill(tokenp, tokenp + count, Token(tree[0].childID, 0));
++    for (size_t y = 0; y < channel.h; ++y) {
++      std::fill_n(channel.Row(y), channel.w, static_cast<pixel_type>(0));
++    }
++    *tokenpp = tokenp + count;
++    return true;
++  }
++  MATreeLookup tree_lookup(tree);
++  Properties properties(num_props);
++  JXL_ASSIGN_OR_RETURN(
++      Channel references,
++      Channel::Create(memory_manager,
++                      properties.size() - kNumNonrefProperties, channel.w));
++  const ptrdiff_t onerow = channel.plane.PixelsPerRow();
++
++  for (size_t y = 0; y < channel.h; ++y) {
++    pixel_type *JXL_RESTRICT p = channel.Row(y);
++    PrecomputeReferences(channel, y, *image, chan, &references);
++    InitPropsRow(&properties, static_props, y);
++    for (size_t x = 0; x < channel.w; ++x) {
++      PredictionResult res =
++          PredictTreeNoWP(&properties, channel.w, p + x, onerow, x, y,
++                          tree_lookup, references);
++      const bool is_aperture =
++          res.predictor == Predictor::Zero &&
++          res.guess == kInputApertureOffset && res.multiplier == 1;
++      const uint32_t packed_residual = is_aperture ? 2 : 0;
++      *tokenp++ = Token(res.context, packed_residual);
++      p[x] = static_cast<pixel_type>(
++          res.guess + UnpackSigned(packed_residual) * res.multiplier);
++    }
++  }
++
++  *tokenpp = tokenp;
++  return true;
++}
++
+ }  // namespace
+ 
+ Tree PredefinedTree(ModularOptions::TreeKind tree_kind, size_t total_pixels,
+@@ -681,7 +753,21 @@ Status ModularCompress(const Image &image, const ModularOptions &options,
+     total_tokens += image.channel[i].w * image.channel[i].h;
+   }
+   if (options.zero_tokens) {
+-    tokens.resize(tokens.size() + total_tokens, {0, 0});
++    size_t pos = tokens.size();
++    tokens.resize(pos + total_tokens);
++    Token *tokenp = tokens.data() + pos;
++    JXL_ASSIGN_OR_RETURN(Image generated, Image::Clone(image));
++    for (size_t i = 0; i < nb_channels; i++) {
++      if (i >= generated.nb_meta_channels &&
++          (generated.channel[i].w > options.max_chan_size ||
++           generated.channel[i].h > options.max_chan_size)) {
++        break;
++      }
++      if (!generated.channel[i].w || !generated.channel[i].h) continue;
++      JXL_RETURN_IF_ERROR(GenerateModularChannelMAANS(
++          &generated, i, tree, &tokenp, group_id));
++    }
++    JXL_ENSURE(tokenp == tokens.data() + tokens.size());
+   } else {
+     // Do one big allocation for all the tokens we'll need,
+     // to avoid reallocs that might require copying.
+diff --git a/tools/jxl_from_tree.cc b/tools/jxl_from_tree.cc
+index d405eea..eecdef1 100644
+--- a/tools/jxl_from_tree.cc
++++ b/tools/jxl_from_tree.cc
+@@ -189,6 +189,17 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
+     }
+     p = predictor_map.at(t);
+     t = tok();
++    uint32_t multiplier = 1;
++    if (t == "*") {
++      t = tok();
++      size_t multiplier_num = 0;
++      multiplier = std::stoul(t, &multiplier_num);
++      if (multiplier_num != t.size() || multiplier == 0) {
++        fprintf(stderr, "Invalid multiplier: %s\n", t.c_str());
++        return false;
++      }
++      t = tok();
++    }
+     bool subtract = false;
+     if (t == "-") {
+       subtract = true;
+@@ -203,7 +214,7 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
+       return false;
+     }
+     if (subtract) offset = -offset;
+-    tree.emplace_back(PropertyDecisionNode::Leaf(p, offset));
++    tree.emplace_back(PropertyDecisionNode::Leaf(p, offset, multiplier));
+     return true;
+   } else if (t == "Width") {
+     t = tok();
+@@ -242,8 +253,8 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
+     t = tok();
+     size_t num = 0;
+     cparams.move_to_front_from_channel = -1 - std::stoul(t, &num);
+-    if (num != t.size() || num > 16) {
+-      fprintf(stderr, "Invalid HiddenChannel (max 16): %s\n", t.c_str());
++    if (num != t.size() || num > 61) {
++      fprintf(stderr, "Invalid HiddenChannel (max 61): %s\n", t.c_str());
+       return false;
+     }
+   } else if (t == "RCT") {
+@@ -497,7 +508,10 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
+   cparams.ec_resampling = 1;
+   cparams.modular_group_size_shift = 3;
+   cparams.colorspace = 0;
+-  cparams.speed_tier = jxl::SpeedTier::kGlacier;
++  // Custom trees can contain millions of nodes.  Glacier's optimal LZ77
++  // search over the serialized tree is prohibitively slow and has no bearing
++  // on decoder semantics, so use the fast standards-equivalent entropy path.
++  cparams.speed_tier = jxl::SpeedTier::kHare;
+   cparams.buffering = 0;
+   JxlMemoryManager* memory_manager = jpegxl::tools::NoMemoryManager();
+   auto io = jxl::make_unique<CodecInOut>(memory_manager);
+@@ -604,6 +618,11 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
+     io->frames[0].blend = true;
+   }
+ 
++  // Developer-only alignment witness for raw EOF apertures.  The logical
++  // bit count (before TakeBytes pads the last storage byte) lets the
++  // hash-machine generator choose the number of ignored one-bit visits
++  // needed to put its 320-bit payload on an exact byte boundary.
++  fprintf(stderr, "JXL_FROM_TREE_LOGICAL_BITS=%zu\n", writer.BitsWritten());
+   compressed = std::move(writer).TakeBytes();
+ 
+   if (!WriteFile(out, compressed)) {
